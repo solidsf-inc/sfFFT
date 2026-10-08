@@ -2,14 +2,23 @@
 NVCC ?= nvcc
 ARCH ?= sm_121
 NVCCFLAGS ?= -O3 -std=c++17
+CXX ?= c++
+TEST_BIN ?= tests/selection_test
 
-sffft: src/sffft.cu
+sffft: src/sffft.cu src/selection.h
 	$(NVCC) $(NVCCFLAGS) -arch=$(ARCH) -o $@ $< -lcufft
 
 bench: sffft
 	./scripts/run_bench.sh
 
 clean:
-	rm -f sffft
+	rm -f sffft $(TEST_BIN)
 
-.PHONY: bench clean
+test:
+	$(CXX) -O2 -std=c++17 -o $(TEST_BIN) tests/selection_test.cpp
+	$(TEST_BIN)
+
+test-gpu: sffft
+	bash tests/precision_smoke.sh
+
+.PHONY: bench clean test test-gpu

@@ -40,6 +40,8 @@ The raw output is in [`results/gb10_dgx_spark.csv`](results/gb10_dgx_spark.csv).
 
 sfFFT uses **fp16 tensor-core multiplies with fp32 accumulation**, so it trades accuracy for speed.
 
+The benchmark also includes an experimental **fp16 accumulation** mode. Its smaller accumulator scratch space and register footprint may improve speed, at the cost of additional rounding and a smaller accumulation range. Both modes keep fp16 intermediate FFT storage and fp32 twiddle/spectrum arithmetic. Use calibration to decide whether the relaxed mode meets your error budget.
+
 | | relative L2 error |
 |---|---|
 | cuFFT fp32 pipeline vs fp64 direct convolution | ~3e-7 |
@@ -71,9 +73,53 @@ make                    # builds ./sffft for sm_121 (GB10)
 ./sffft 8 768 2048      # one length only
 make bench              # sweep + CSV in results/ + plot (needs python3 with matplotlib, numpy)
 python3 scripts/plot.py results/<file>.csv docs/benchmark_local.png
+make test               # CPU-only precision-selector tests
+make test-gpu           # small GB10 precision/CLI regression checks
 ```
 
 Each output line is `RESULT,L,method,config,ms,rel_err`. Every run reports relative L2 error for the fused kernel against cuFFT, and for cuFFT against an fp64 direct convolution on sample sequences. Numerical errors are reported, without an automatic pass/fail threshold.
+
+## Select by an error budget
+
+Choose a positive relative L2 error target and an explicit I/O type:
+
+```bash
+./sffft 8 768 2048 --max-error 1e-3 --io fp32  # 0.1% relative L2 error
+./sffft 8 768 2048 --max-error 1e-2 --io bf16  # 1% relative L2 error
+./sffft 8 768 2048 --max-error 1e-2 --io any   # allow either I/O type
+./sffft 8 768 2048 --max-error 1e-3 --io fp32 --seed 42
+./sffft 1 1 128 --max-error 1e-3 --io fp32 --input-scale 15000
+```
+
+`10e-3` is `0.01` (1%); `1e-3` is `0.001` (0.1%). The default I/O constraint is `fp32`. Each run measures all supported plans with fp32 and fp16 accumulation, rejects non-finite results, and prints the fastest passing candidate for each requested length:
+
+```text
+SELECT,L,method,config,ms,rel_err,max_error,io
+```
+
+The error is `||candidate - cuFFT_fp32||₂ / ||cuFFT_fp32||₂`, measured over every output element of the generated calibration batch. BF16 candidate error includes input/output rounding relative to the original fp32 inputs. A zero reference passes only if the candidate is also exactly zero. If no fused candidate meets the budget, the program prints `NO_MATCH,L,io,max_error` and exits with status 2. Invalid arguments exit with status 1. It does not silently relax the target or switch to cuFFT.
+
+This is an empirical calibration selector. It reports a plan/configuration, and the current convolution interface remains the CUDA kernel in `src/sffft.cu`. A positive target does not guarantee that a matching mode exists, and passing generated inputs does not guarantee the same error on other data. Test representative inputs, amplitudes, and filters before reusing a selected configuration. `--seed` changes the generated calibration inputs reproducibly; `--input-scale` multiplies the generated input amplitudes so you can probe range and overflow. The reusable host selector in [`src/selection.h`](src/selection.h) accepts measured candidates from your own calibration workflow.
+
+Times cover the convolution kernels; calibration, filter-spectrum preparation, allocation, and BF16 input conversion are excluded. Keep I/O fixed when comparing execution speed for an application. `--io any` allows a data-type change explicitly.
+
+Method names `fused_fp32io` and `fused_bf16io` retain fp32 accumulation. `fused_fp16acc_fp32io` and `fused_fp16acc_bf16io` identify fp16 accumulation. The included historical benchmark table and plot above use fp32 accumulation.
+
+### GB10 precision/speed experiment
+
+At the original batch size of 8 x 768 channels, three sequential sweeps with CUDA 13.2 compared both accumulation modes in the same binary. The table uses the fastest plan by median time across the three repeats, with BF16 I/O fixed. These generated inputs met a 1% error budget with substantially less error:
+
+| L | FP32 accumulate, BF16 I/O (ms) | FP16 accumulate, BF16 I/O (ms) | speedup | FP16 accumulate relative L2 error |
+|---:|---:|---:|---:|---:|
+| 128 | 0.033 | 0.029 | 1.13x | 0.241% |
+| 256 | 0.064 | 0.055 | 1.15x | 0.240% |
+| 512 | 0.150 | 0.129 | 1.16x | 0.240% |
+| 1024 | 0.467 | 0.378 | 1.24x | 0.244% |
+| 2048 | 0.642 | 0.487 | 1.32x | 0.244% |
+| 4096 | 1.331 | 1.032 | 1.29x | 0.242% |
+| 8192 | 3.491 | 3.152 | 1.11x | 0.242% |
+
+Raw candidate timings and selections are in [`results/gb10_precision_sweep.csv`](results/gb10_precision_sweep.csv). FP16 accumulation was 1.11x–1.32x faster in this experiment, with about 0.24% relative L2 error. This is a measured improvement for the supplied workload, and does not establish a worst-case error bound. FP32 I/O candidates with FP16 accumulation measured approximately 0.05%–0.07% error, allowing a 0.1% target on these inputs.
 
 ## Status and limitations
 
