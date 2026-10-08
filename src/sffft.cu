@@ -1,7 +1,7 @@
 // sfFFT: fused causal FFT convolution on NVIDIA tensor cores (tuned on GB10 / DGX Spark).
 // SPDX-License-Identifier: MIT
 // y[b,h,0:L] = causal_conv(u[b,h,0:L], k[h,0:L]) via length N=2L transform, N = R0*R1(*R2), radices 16/32/64.
-// Every stage is a batch of small complex DFT matmuls on fp16 tensor cores (fp32 accumulate); data stays in shared memory.
+// Every stage is a batch of small complex DFT matmuls on fp16 tensor cores; data stays in shared memory.
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -94,17 +94,20 @@ template<int R0_, int R1_, int R2_ = 1> struct Plan {
   static constexpr int N = R0_*R1_*R2_, L = N/2;
   __host__ __device__ static constexpr int R(int j) { return j==0 ? R0_ : (j==1 ? R1_ : R2_); }
   __host__ __device__ static constexpr int Nj(int j) { return j==0 ? N : (j==1 ? N/R0_ : (j==2 ? N/(R0_*R1_) : 1)); }
-  __host__ __device__ static constexpr int Foff(int j) { return j==0 ? 0 : (j==1 ? 2*R0_*R0_ : 2*R0_*R0_ + 2*R1_*R1_); }
-  static constexpr int Fsize = 2*R0_*R0_ + 2*R1_*R1_ + (R2_ > 1 ? 2*R2_*R2_ : 0);
+  __host__ __device__ static constexpr int Foff(int j) {
+    return j==0 ? 0 : j==1 ? (R1_==R0_ ? 0 : 2*R0_*R0_) :
+           R2_==R0_ ? 0 : R2_==R1_ ? Foff(1) : 2*R0_*R0_ + (R1_==R0_ ? 0 : 2*R1_*R1_);
+  }
+  static constexpr int Fsize = 2*R0_*R0_ + (R1_==R0_ ? 0 : 2*R1_*R1_) +
+                               (R2_>1 && R2_!=R0_ && R2_!=R1_ ? 2*R2_*R2_ : 0);
   template<int W, typename TAcc = float> static constexpr int smem() { return 4*N + 2*Fsize + W*256*sizeof(TAcc); }
 };
 
-template<class P, int J, bool CACHED>
+template<class P, int J>
 __device__ __forceinline__ float2 twid(int pos, const float2* __restrict__ tw, bool cj) {
   constexpr int Nm = P::Nj(J), Nm1 = P::Nj(J+1), RJ = P::R(J);
   const int nrest = pos % Nm1, km = (pos / Nm1) % RJ;
   int e = (P::N/Nm)*nrest*km; if (e > P::N/2) e -= P::N;
-  if constexpr (CACHED) { float2 value = __ldg(tw + (e & (P::N-1))); return make_float2(value.x, cj ? -value.y : value.y); }
   float sv, cv; __sincosf(-6.283185307179586f*(float)e/(float)P::N, &sv, &cv);
   return make_float2(cv, cj ? -sv : sv);
 }
@@ -132,7 +135,7 @@ __device__ __forceinline__ void st8out(__nv_bfloat16* d, const float* v, float s
   *reinterpret_cast<uint4*>(d) = *reinterpret_cast<uint4*>(h); }
 
 // DFT along axis J (stride s = Nj(J+1) >= 16): per (outer block, 16-column strip) left-multiply by F_R (or conj).
-template<class P, int J, bool INV, int W, typename TIO, typename TAcc, bool CACHED>
+template<class P, int J, bool INV, int W, typename TIO, typename TAcc>
 __device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, TAcc* scr,
                                            const float2* __restrict__ tw, const float2* __restrict__ K, TIO* yp) {
   constexpr int R = P::R(J), s = P::Nj(J+1), RT = R/16, ST = s/16, UNITS = (P::N/(R*s))*ST;
@@ -181,8 +184,8 @@ __device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, TA
         #pragma unroll
         for (int e = 0; e < 8; e++) {
           const float a = va[e]*sc, b = vb[e]*sc; float2 w;
-          if constexpr (!INV) w = twid<P,J,CACHED>(pos0+e, tw, false);
-          else w = twid<P,(J>0?J-1:0),CACHED>(pos0+e, tw, true);
+          if constexpr (!INV) w = twid<P,J>(pos0+e, tw, false);
+          else w = twid<P,(J>0?J-1:0)>(pos0+e, tw, true);
           orr[e] = a*w.x - b*w.y; oi[e] = a*w.y + b*w.x;
         }
         st8h(Xr + pos0, orr); st8h(Xi + pos0, oi);
@@ -192,7 +195,7 @@ __device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, TA
 }
 
 // DFT along the last axis (stride 1): per 16-row strip right-multiply by F_R (or conj). Forward ends with the kernel spectrum.
-template<class P, bool INV, int W, typename TAcc, bool CACHED>
+template<class P, bool INV, int W, typename TAcc>
 __device__ __forceinline__ void right_stage(half* Xr, half* Xi, const half* F, TAcc* scr,
                                             const float2* __restrict__ tw, const float2* __restrict__ K) {
   constexpr int J = P::S - 1, R = P::R(J), RT = R/16, UNITS = P::N/(R*16);
@@ -229,7 +232,7 @@ __device__ __forceinline__ void right_stage(half* Xr, half* Xi, const half* F, T
       #pragma unroll
       for (int e = 0; e < 8; e++) {
         const float a = va[e]*sc, b = vb[e]*sc;
-        float2 w; if constexpr (!INV) w = kw[e]; else w = twid<P,(J>0?J-1:0),CACHED>(pos0+e, tw, true);
+        float2 w; if constexpr (!INV) w = kw[e]; else w = twid<P,(J>0?J-1:0)>(pos0+e, tw, true);
         orr[e] = a*w.x - b*w.y; oi[e] = a*w.y + b*w.x;
       }
       st8h(Xr + pos0, orr); st8h(Xi + pos0, oi);
@@ -249,7 +252,9 @@ fftconv(const TIO* __restrict__ u, const float2* __restrict__ Kf, const float2* 
   const int tid = threadIdx.x, NT = W*32;
   #pragma unroll
   for (int j = 0; j < P::S; j++) {
-    const int R = P::R(j); half* Fr = F + P::Foff(j); half* Fi = Fr + R*R;
+    const int R = P::R(j);
+    if ((j > 0 && R == P::R(0)) || (j > 1 && R == P::R(1))) continue;
+    half* Fr = F + P::Foff(j); half* Fi = Fr + R*R;
     if constexpr (CACHED) {
       const half* source = dft + (R == 16 ? 0 : R == 32 ? 512 : 2560);
       for (int idx = tid*8; idx < 2*R*R; idx += NT*8) *reinterpret_cast<uint4*>(Fr+idx) = *reinterpret_cast<const uint4*>(source+idx);
@@ -266,12 +271,12 @@ fftconv(const TIO* __restrict__ u, const float2* __restrict__ Kf, const float2* 
     st8h(Xr + idx, v); }
   for (int idx = L + tid*8; idx < N; idx += NT*8) *reinterpret_cast<uint4*>(Xr + idx) = make_uint4(0,0,0,0);
   __syncthreads();
-  left_stage<P,0,false,W,TIO,TAcc,CACHED>(Xr, Xi, F, scr, tw, K, yp); __syncthreads();
-  if constexpr (P::S == 3) { left_stage<P,1,false,W,TIO,TAcc,CACHED>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
-  right_stage<P,false,W,TAcc,CACHED>(Xr, Xi, F, scr, tw, K); __syncwarp();   // same warp owns the same strips: no block barrier
-  right_stage<P,true,W,TAcc,CACHED>(Xr, Xi, F, scr, tw, K); __syncthreads();
-  if constexpr (P::S == 3) { left_stage<P,1,true,W,TIO,TAcc,CACHED>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
-  left_stage<P,0,true,W,TIO,TAcc,CACHED>(Xr, Xi, F, scr, tw, K, yp);
+  left_stage<P,0,false,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp); __syncthreads();
+  if constexpr (P::S == 3) { left_stage<P,1,false,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
+  right_stage<P,false,W,TAcc>(Xr, Xi, F, scr, tw, K); __syncwarp();   // same warp owns the same strips: no block barrier
+  right_stage<P,true,W,TAcc>(Xr, Xi, F, scr, tw, K); __syncthreads();
+  if constexpr (P::S == 3) { left_stage<P,1,true,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
+  left_stage<P,0,true,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp);
 }
 
 // ---- spectrum layout + cuFFT baseline ----

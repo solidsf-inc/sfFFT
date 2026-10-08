@@ -59,6 +59,7 @@ printf 'PASS: CLI validation, unattainable targets, I/O constraints, two seeds, 
 for allocator in device managed mapped hybrid; do
   ./sffft 1 1 --max-error 1e-3 --io fp32 --allocator "$allocator" --kernel cached > "$work/allocator.csv"
   awk -F, -v allocator="$allocator" '
+    $1=="RESULT" && $3~/^fused/ { if ($6~/nan|inf/ || $6+0 > ($3~/bf16io/ ? 6e-3 : 2e-3)) bad++ }
     $1=="SELECT" { n++; if ($6+0 > $7+0 || $8!="fp32" || $4!~/kernel_cached/) bad++ }
     $1=="MEMORY" { m++; if ($3!=allocator || (allocator!="device" && ($8+0!=0 || $5+0!=0)) || ((allocator=="managed" || allocator=="mapped") && $7+0!=0)) bad++ }
     END { if(n!=7 || m!=7 || bad) exit 1 }
@@ -69,6 +70,7 @@ printf 'PASS: four allocators with cached kernels preserve error budgets and sha
 for seed in 42 12345; do
   ./sffft 1 1 --max-error 1e-3 --io fp32 --kernel auto --seed "$seed" > "$work/auto.csv"
   awk -F, '
+    $1=="RESULT" && $3~/^fused/ { if ($6~/nan|inf/ || $6+0 > ($3~/bf16io/ ? 6e-3 : 2e-3)) bad++ }
     $1=="RESULT" && $4~/kernel_cached/ { cached++ }
     $1=="RESULT" && $4~/kernel_legacy/ { legacy++ }
     $1=="SELECT" { n++; if ($6+0 > $7+0 || $8!="fp32") bad++ }

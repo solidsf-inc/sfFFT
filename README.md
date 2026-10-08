@@ -123,20 +123,29 @@ Raw candidate timings and selections are in [`results/gb10_precision_sweep.csv`]
 
 ## GB10 allocation modes
 
-sfFFT can allocate its owned buffers using device memory, managed memory, or mapped CPU memory:
+sfFFT can allocate its owned buffers using device memory, managed memory, mapped CPU memory, or a hybrid of mapped I/O and device workspaces:
 
 ```bash
 ./sffft --memory-info
 ./sffft 8 768 2048 --max-error 1e-2 --io bf16 --allocator device
 ./sffft 8 768 2048 --max-error 1e-2 --io bf16 --allocator managed
 ./sffft 8 768 2048 --max-error 1e-2 --io bf16 --allocator mapped
+./sffft 8 768 2048 --max-error 1e-2 --io bf16 --allocator hybrid --kernel auto
 ```
 
 `device` remains the default. `mapped` uses `cudaHostAllocMapped` and the CUDA device alias, providing a CPU allocation that the GPU can access directly. `managed` uses `cudaMallocManaged`, with prefetching when concurrent managed access is supported. Both host-visible modes generate the input and filter directly in shared CPU/GPU allocations, and validate outputs through synchronized CPU views. The filter-spectrum workspace is allocated once per length and reused across all plans.
 
+`hybrid` keeps input, output, reference output, and the initial filter buffer CPU-visible, while GPU-only workspaces, the converted BF16 input, filter spectra, and coefficient tables use `cudaMalloc`. CPU validation reads the mapped outputs after synchronization. The small coefficient tables are explicitly uploaded; data buffers need no explicit upload or download.
+
 The implementation uses public CUDA APIs. GB10 has a shared physical memory architecture; this mode does not create a separate Grace/HBM memory tier. [NVIDIA's Spark porting guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html) explains that `cudaMalloc` allocations on Spark cannot be coherently accessed by the CPU, while [CUDA's memory guide](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html) describes managed and mapped allocations. Allocator support is checked at runtime, and unsupported requests fail explicitly.
 
 `RESULT` and `SELECT` continue to measure warmed GPU execution. Additional `MEMORY` rows report owned allocation bytes, persistent host shadow bytes, allocation time, explicit upload/download bytes, explicit copy time, and constructor setup time. Setup includes the benchmark's generated inputs and cuFFT plan/spectrum preparation. These fields separate allocator/setup effects from kernel speed; cuFFT's internal workspaces and temporary validation vectors are outside the owned-buffer byte count. Host-visible modes avoid explicit host/device copies but still access physical memory and may incur coherence or page-management costs.
+
+### Cached coefficients and automatic kernel selection
+
+`--kernel cached` loads precomputed FP16 DFT matrices instead of regenerating them inside every block. The table contains 21 KiB of coefficients for radices 16, 32, and 64. Stages with the same radix share one DFT matrix in shared memory in both kernel variants, reducing allocation and initialization work. Twiddles remain computed on the GPU: experimental cached twiddle loads were slower at longer lengths. The transform and convolution remain fused in one launch.
+
+`--kernel auto` measures both cached and legacy kernels with both accumulation types, then `--max-error` selects the fastest eligible configuration. Configurations include `kernel_cached` or `kernel_legacy` so the choice is reproducible. `--kernel legacy` remains the default. Caching exchanges computation for memory loads, so its value depends on length, plan, and allocator; validate performance and error on your workload.
 
 ## Status and limitations
 
