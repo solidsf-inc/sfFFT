@@ -244,10 +244,10 @@ struct Bench {
     for (int i = 0; i < 3; i++) f(); CK(cudaDeviceSynchronize());
     CK(cudaEventRecord(e0)); for (int i = 0; i < iters; i++) f(); CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
     float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); CK(cudaGetLastError()); return ms/iters; }
-  Bench(int L_, int B_, int H_) : L(L_), N(2*L_), H(H_), B(B_), BH((size_t)B_*H_) {
+  Bench(int L_, int B_, int H_, double input_scale = 1) : L(L_), N(2*L_), H(H_), B(B_), BH((size_t)B_*H_) {
     iters = std::max(10, (int)(20000/L)); if (iters > 200) iters = 200;
     hu.resize(BH*L); hk.resize((size_t)H*L);
-    for (auto& v : hu) v = (float)nrand();
+    for (auto& v : hu) v = (float)(nrand()*input_scale);
     for (int h = 0; h < H; h++) { double a = 1.0/(4.0 + (double)L*h/H);
       for (int n = 0; n < L; n++) hk[(size_t)h*L+n] = (float)(nrand()*exp(-a*n)*sqrt(2*a)); }
     std::vector<cufftComplex> hkc((size_t)H*N);
@@ -316,7 +316,7 @@ struct Bench {
 };
 
 static void usage() {
-  printf("Usage: sffft [B H [L]] [--max-error REL_L2] [--io fp32|bf16|any] [--seed N]\n"
+  printf("Usage: sffft [B H [L]] [--max-error REL_L2] [--io fp32|bf16|any] [--seed N] [--input-scale SCALE]\n"
          "L: 0 (all) or a power of two from 128 to 8192. Defaults: B=8 H=768, io=fp32.\n"
          "--max-error selects the fastest passing fused plan on these calibration inputs.\n"
          "Error is measured against cuFFT fp32; no match exits 2. Invalid arguments exit 1.\n");
@@ -324,7 +324,7 @@ static void usage() {
 
 int main(int argc, char** argv) {
   int B = 8, H = 768, only = 0, positional = 0, failed = 0;
-  double max_error = -1; const char* io = "fp32";
+  double max_error = -1, input_scale = 1; const char* io = "fp32";
   for (int i = 1; i < argc; i++) {
     const char* arg = argv[i]; char* end = nullptr; errno = 0;
     if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) { usage(); return 0; }
@@ -333,6 +333,12 @@ int main(int argc, char** argv) {
       max_error = strtod(argv[i], &end);
       if (errno || end == argv[i] || *end || !std::isfinite(max_error) || max_error <= 0) {
         fprintf(stderr, "--max-error must be positive and finite\n"); return 1;
+      }
+    } else if (!strcmp(arg, "--input-scale")) {
+      if (++i == argc) { usage(); return 1; }
+      input_scale = strtod(argv[i], &end);
+      if (errno || end == argv[i] || *end || !std::isfinite(input_scale) || input_scale <= 0 || input_scale > std::numeric_limits<float>::max()) {
+        fprintf(stderr, "--input-scale must be positive, finite, and representable in fp32\n"); return 1;
       }
     } else if (!strcmp(arg, "--io")) {
       if (++i == argc) { usage(); return 1; }
@@ -362,10 +368,10 @@ int main(int argc, char** argv) {
   }
   cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, 0));
   printf("# %s sm_%d%d %d SMs, smem/block %zu, L2 %d MB, B=%d H=%d\n", p.name, p.major, p.minor, p.multiProcessorCount, p.sharedMemPerBlockOptin, p.l2CacheSize>>20, B, H);
-  printf("# calibration seed=%llu, max_error=%.9e, io=%s\n", rng, max_error, io);
+  printf("# calibration seed=%llu, input_scale=%.9e, max_error=%.9e, io=%s\n", rng, input_scale, max_error, io);
   printf("# RESULT,L,method,config,ms,rel_err\n");
   if (max_error > 0) printf("# SELECT,L,method,config,ms,rel_err,max_error,io\n");
-#define RUN(LL, ...) if (!only || only == LL) { Bench b(LL, B, H); b.baseline(); __VA_ARGS__ if (max_error > 0 && !b.select(max_error, io)) failed++; }
+#define RUN(LL, ...) if (!only || only == LL) { Bench b(LL, B, H, input_scale); b.baseline(); __VA_ARGS__ if (max_error > 0 && !b.select(max_error, io)) failed++; }
   RUN(128,  b.variants<Plan<16,16>,4>("16x16"); b.variants<Plan<16,16>,8>("16x16"); )
   RUN(256,  b.variants<Plan<32,16>,4>("32x16"); b.variants<Plan<16,32>,4>("16x32"); b.variants<Plan<32,16>,8>("32x16"); )
   RUN(512,  b.variants<Plan<32,32>,4>("32x32"); b.variants<Plan<32,32>,8>("32x32"); b.variants<Plan<64,16>,4>("64x16"); b.variants<Plan<16,64>,4>("16x64"); )
