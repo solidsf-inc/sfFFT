@@ -1,0 +1,4 @@
+/sffft
+*.o
+__pycache__/
+docs/benchmark_local.png
