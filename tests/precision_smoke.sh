@@ -25,6 +25,10 @@ check_exit 1 --seed 0
 check_exit 1 --seed -1
 check_exit 1 --input-scale inf
 check_exit 1 --input-scale 0
+check_exit 1 --allocator unknown
+check_exit 1 --allocator
+check_exit 1 --kernel unknown
+check_exit 1 --kernel
 check_exit 1 0 1 128
 check_exit 1 1 0 128
 check_exit 1 1 1 129
@@ -51,3 +55,32 @@ awk -F, '
 check_exit 2 1 1 128 --max-error 1e-3 --io fp32 --input-scale 25000
 grep -q '^NO_MATCH,128,fp32,' "$work/check.csv"
 printf 'PASS: CLI validation, unattainable targets, I/O constraints, two seeds, and FP16 overflow rejection\n'
+
+for allocator in device managed mapped hybrid; do
+  ./sffft 1 1 --max-error 1e-3 --io fp32 --allocator "$allocator" --kernel cached > "$work/allocator.csv"
+  awk -F, -v allocator="$allocator" '
+    $1=="RESULT" && $3~/^fused/ { if ($6~/nan|inf/ || $6+0 > ($3~/bf16io/ ? 6e-3 : 2e-3)) bad++ }
+    $1=="SELECT" { n++; if ($6+0 > $7+0 || $8!="fp32" || $4!~/kernel_cached/) bad++ }
+    $1=="MEMORY" { m++; if ($3!=allocator || (allocator!="device" && ($8+0!=0 || $5+0!=0)) || ((allocator=="managed" || allocator=="mapped") && $7+0!=0)) bad++ }
+    END { if(n!=7 || m!=7 || bad) exit 1 }
+  ' "$work/allocator.csv"
+done
+printf 'PASS: four allocators with cached kernels preserve error budgets and shared CPU views avoid output copies\n'
+
+for seed in 42 12345; do
+  ./sffft 1 1 --max-error 1e-3 --io fp32 --kernel auto --seed "$seed" > "$work/auto.csv"
+  awk -F, '
+    $1=="RESULT" && $3~/^fused/ { if ($6~/nan|inf/ || $6+0 > ($3~/bf16io/ ? 6e-3 : 2e-3)) bad++ }
+    $1=="RESULT" && $4~/kernel_cached/ { cached++ }
+    $1=="RESULT" && $4~/kernel_legacy/ { legacy++ }
+    $1=="SELECT" { n++; if ($6+0 > $7+0 || $8!="fp32") bad++ }
+    END { if(n!=7 || cached!=112 || legacy!=112 || bad) exit 1 }
+  ' "$work/auto.csv"
+done
+./sffft 1 1 128 --max-error 1e-3 --io fp32 --kernel cached --input-scale 15000 > "$work/range.csv"
+awk -F, '
+  $1=="RESULT" && $3~/fp16acc/ && $6~/nan|inf/ { rejected++ }
+  $1=="SELECT" { n++; if ($3!="fused_fp32io" || $6+0 > $7+0) bad++ }
+  END { if(n!=1 || bad || !rejected) exit 1 }
+' "$work/range.csv"
+printf 'PASS: automatic kernel selection across all lengths and two seeds; cached FP16 overflow rejected\n'
