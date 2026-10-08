@@ -74,6 +74,7 @@ make                    # builds ./sffft for sm_121 (GB10)
 make bench              # sweep + CSV in results/ + plot (needs python3 with matplotlib, numpy)
 python3 scripts/plot.py results/<file>.csv docs/benchmark_local.png
 make test               # CPU-only precision-selector tests
+make test-gpu           # small GB10 precision/CLI regression checks
 ```
 
 Each output line is `RESULT,L,method,config,ms,rel_err`. Every run reports relative L2 error for the fused kernel against cuFFT, and for cuFFT against an fp64 direct convolution on sample sequences. Numerical errors are reported, without an automatic pass/fail threshold.
@@ -87,7 +88,7 @@ Choose a positive relative L2 error target and an explicit I/O type:
 ./sffft 8 768 2048 --max-error 1e-2 --io bf16  # 1% relative L2 error
 ./sffft 8 768 2048 --max-error 1e-2 --io any   # allow either I/O type
 ./sffft 8 768 2048 --max-error 1e-3 --io fp32 --seed 42
-./sffft 1 1 128 --max-error 1e-3 --io fp32 --input-scale 10000
+./sffft 1 1 128 --max-error 1e-3 --io fp32 --input-scale 15000
 ```
 
 `10e-3` is `0.01` (1%); `1e-3` is `0.001` (0.1%). The default I/O constraint is `fp32`. Each run measures all supported plans with fp32 and fp16 accumulation, rejects non-finite results, and prints the fastest passing candidate for each requested length:

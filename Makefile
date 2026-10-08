@@ -18,4 +18,7 @@ test:
 	$(CXX) -O2 -std=c++17 -o $(TEST_BIN) tests/selection_test.cpp
 	$(TEST_BIN)
 
-.PHONY: bench clean test
+test-gpu: sffft
+	bash tests/precision_smoke.sh
+
+.PHONY: bench clean test test-gpu
