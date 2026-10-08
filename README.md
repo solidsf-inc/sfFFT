@@ -77,7 +77,7 @@ make test               # CPU-only precision-selector tests
 make test-gpu           # small GB10 precision/CLI regression checks
 ```
 
-Each output line is `RESULT,L,method,config,ms,rel_err`. Every run reports relative L2 error for the fused kernel against cuFFT, and for cuFFT against an fp64 direct convolution on sample sequences. Numerical errors are reported, without an automatic pass/fail threshold.
+Each output line is `RESULT,L,method,config,ms,rel_err`. Every run reports relative L2 error for the fused kernel against cuFFT, and for cuFFT against an fp64 direct convolution on sample sequences. Without `--max-error`, numerical errors are reported without an automatic pass/fail threshold.
 
 ## Select by an error budget
 
@@ -147,13 +147,33 @@ The implementation uses public CUDA APIs. GB10 has a shared physical memory arch
 
 `--kernel auto` measures both cached and legacy kernels with both accumulation types, then `--max-error` selects the fastest eligible configuration. Configurations include `kernel_cached` or `kernel_legacy` so the choice is reproducible. `--kernel legacy` remains the default. Caching exchanges computation for memory loads, so its value depends on length, plan, and allocator; validate performance and error on your workload.
 
+### Allocation and DFT experiment
+
+The following times are three-run medians on GB10 with CUDA 13.2, B=8, H=768, BF16 I/O, and a 1% error budget. The baseline uses [3f93f2b](https://github.com/solidsf-inc/sfFFT/commit/3f93f2bbdc551ec6ce8c3d1cef93baab795e82e7), before matrix sharing and caching; the optimized code is [9605cb2](https://github.com/solidsf-inc/sfFFT/commit/9605cb2a0130671ecdb98bae79ac598e28bf2d6b). Both already include FP16 accumulation. Each run selects its fastest passing plan, and optimized runs use `--kernel auto`.
+
+| L | Before, device (ms) | Optimized, device (ms) | Extra speedup | Optimized, hybrid (ms) |
+|---:|---:|---:|---:|---:|
+| 128 | 0.02938 | 0.02422 | 1.21x | 0.02584 |
+| 256 | 0.05532 | 0.04656 | 1.19x | 0.04919 |
+| 512 | 0.13223 | 0.11653 | 1.13x | 0.11651 |
+| 1024 | 0.39114 | 0.36342 | 1.08x | 0.33687 |
+| 2048 | 0.49408 | 0.47472 | 1.04x | 0.49727 |
+| 4096 | 1.10517 | 1.02716 | 1.08x | 1.15405 |
+| 8192 | 3.18575 | 3.13771 | 1.02x | 3.72262 |
+
+Selected errors were 0.240%–0.244%, below the requested 1%. The throughput gains come from matrix reuse/caching and measured plan selection. Small differences at longer lengths should be read alongside timing variation in the raw runs.
+
+Hybrid avoids bulk data copies and removes the benchmark's persistent input/reference shadow buffers: at L=8192, that saves 384 MiB of host shadows and reduces explicit uploads from about 288 MiB to 149 KiB of coefficient tables. It still accesses the same physical memory, and the longer-length GPU timings are slower than device allocations. Managed and mapped modes also avoid explicit copies; an additional single full-size sweep measured L=8192 at 3.70468 ms for managed and 5.90374 ms for mapped. Mapping every workspace is therefore an experimental option, not the throughput default.
+
+Use `--allocator device --kernel auto` to calibrate for GPU throughput, or compare `--allocator hybrid` when CPU-visible I/O matters. All candidate timings, selected errors, allocation metrics, repeat counts, and source commits are in [`results/gb10_allocator_sweep.csv`](results/gb10_allocator_sweep.csv). `make test-gpu` checks every fused candidate on normal inputs, all four allocation modes, automatic selection with two seeds, and overflow rejection.
+
 ## Status and limitations
 
 This is an early release. Please read these before you depend on it.
 
 * **It's a convolution kernel, not a general FFT library.** Today sfFFT does batched causal 1-D convolution with real input and output. Standalone forward and inverse FFTs, complex input, non-causal or circular convolution, and 2-D transforms aren't exposed yet.
 * **Lengths.** It supports L = 128 to 8192, with each length a power of two. Past 8192 the working set doesn't fit in one block's shared memory, so longer sequences need a multi-pass version, which isn't implemented yet.
-* **Hardware.** It has only been tuned and validated on GB10 (sm_121). You can select a different CUDA target with `make ARCH=sm_90`, for example, but compatibility and performance elsewhere are unvalidated. The largest plans require up to 92,160 bytes of shared memory per block.
+* **Hardware.** It has only been tuned and validated on GB10 (sm_121). You can select a different CUDA target with `make ARCH=sm_90`, for example, but compatibility and performance elsewhere are unvalidated. The largest current plans require up to 91,136 bytes of shared memory per block.
 * **API.** The kernel currently lives in a single benchmark source file, `src/sffft.cu`. A header-only library interface and PyTorch bindings are natural next steps.
 
 ## Prior art
