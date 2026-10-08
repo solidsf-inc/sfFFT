@@ -6,6 +6,11 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstring>
+#include "selection.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -16,7 +21,7 @@ using namespace nvcuda;
 #define CK(x) do{cudaError_t e_=(x); if(e_!=cudaSuccess){printf("CUDA %s @%d: %s\n",#x,__LINE__,cudaGetErrorString(e_));exit(1);}}while(0)
 #define CF(x) do{cufftResult r_=(x); if(r_!=CUFFT_SUCCESS){printf("cuFFT %s @%d: %d\n",#x,__LINE__,(int)r_);exit(1);}}while(0)
 
-typedef wmma::fragment<wmma::accumulator,16,16,16,float> Acc;
+template<typename TAcc> using Acc = wmma::fragment<wmma::accumulator,16,16,16,TAcc>;
 typedef wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> FA;
 typedef wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> FB;
 
@@ -27,7 +32,7 @@ template<int R0_, int R1_, int R2_ = 1> struct Plan {
   __host__ __device__ static constexpr int Nj(int j) { return j==0 ? N : (j==1 ? N/R0_ : (j==2 ? N/(R0_*R1_) : 1)); }
   __host__ __device__ static constexpr int Foff(int j) { return j==0 ? 0 : (j==1 ? 2*R0_*R0_ : 2*R0_*R0_ + 2*R1_*R1_); }
   static constexpr int Fsize = 2*R0_*R0_ + 2*R1_*R1_ + (R2_ > 1 ? 2*R2_*R2_ : 0);
-  template<int W> static constexpr int smem() { return 4*N + 2*Fsize + W*1024; }
+  template<int W, typename TAcc = float> static constexpr int smem() { return 4*N + 2*Fsize + W*256*sizeof(TAcc); }
 };
 
 template<class P, int J>
@@ -50,6 +55,10 @@ __device__ __forceinline__ void st8h(half* d, const float* v) {
 __device__ __forceinline__ void ld8f(const float* s, float* v) {
   float4 a = *reinterpret_cast<const float4*>(s), b = *reinterpret_cast<const float4*>(s+4);
   v[0]=a.x; v[1]=a.y; v[2]=a.z; v[3]=a.w; v[4]=b.x; v[5]=b.y; v[6]=b.z; v[7]=b.w; }
+__device__ __forceinline__ void ld8f(const half* s, float* v) {
+  uint4 q = *reinterpret_cast<const uint4*>(s); const half* h = reinterpret_cast<const half*>(&q);
+  #pragma unroll
+  for (int e = 0; e < 8; e++) v[e] = __half2float(h[e]); }
 __device__ __forceinline__ void st8out(float* d, const float* v, float sc) {
   reinterpret_cast<float4*>(d)[0] = make_float4(v[0]*sc, v[1]*sc, v[2]*sc, v[3]*sc);
   reinterpret_cast<float4*>(d)[1] = make_float4(v[4]*sc, v[5]*sc, v[6]*sc, v[7]*sc); }
@@ -58,8 +67,8 @@ __device__ __forceinline__ void st8out(__nv_bfloat16* d, const float* v, float s
   *reinterpret_cast<uint4*>(d) = *reinterpret_cast<uint4*>(h); }
 
 // DFT along axis J (stride s = Nj(J+1) >= 16): per (outer block, 16-column strip) left-multiply by F_R (or conj).
-template<class P, int J, bool INV, int W, typename TIO>
-__device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, float* scr,
+template<class P, int J, bool INV, int W, typename TIO, typename TAcc>
+__device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, TAcc* scr,
                                            const float2* __restrict__ tw, const float2* __restrict__ K, TIO* yp) {
   constexpr int R = P::R(J), s = P::Nj(J+1), RT = R/16, ST = s/16, UNITS = (P::N/(R*s))*ST;
   constexpr bool RIN = (!INV && J == 0), ROUT = (INV && J == 0);
@@ -68,7 +77,7 @@ __device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, fl
   const half* Fr = F + P::Foff(J); const half* Fi = Fr + R*R;
   const float sc = rsqrtf((float)R);
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  float* sr = scr + warp*256;
+  TAcc* sr = scr + warp*256;
   const int rr = lane >> 1, cc0 = (lane & 1)*8;
   for (int u = warp; u < UNITS; u += W) {
     const int outer = u / ST, js = u % ST, base = outer*R*s + js*16;
@@ -80,7 +89,7 @@ __device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, fl
     }
     #pragma unroll
     for (int i = 0; i < IT; i++) {
-      Acc cr, ci, t; wmma::fill_fragment(cr, 0.f); wmma::fill_fragment(ci, 0.f); wmma::fill_fragment(t, 0.f);
+      Acc<TAcc> cr, ci, t; wmma::fill_fragment(cr, 0.f); wmma::fill_fragment(ci, 0.f); wmma::fill_fragment(t, 0.f);
       #pragma unroll
       for (int kk = 0; kk < KT; kk++) {
         FA ar, ai; wmma::load_matrix_sync(ar, Fr + i*16*R + kk*16, R); wmma::load_matrix_sync(ai, Fi + i*16*R + kk*16, R);
@@ -118,14 +127,14 @@ __device__ __forceinline__ void left_stage(half* Xr, half* Xi, const half* F, fl
 }
 
 // DFT along the last axis (stride 1): per 16-row strip right-multiply by F_R (or conj). Forward ends with the kernel spectrum.
-template<class P, bool INV, int W>
-__device__ __forceinline__ void right_stage(half* Xr, half* Xi, const half* F, float* scr,
+template<class P, bool INV, int W, typename TAcc>
+__device__ __forceinline__ void right_stage(half* Xr, half* Xi, const half* F, TAcc* scr,
                                             const float2* __restrict__ tw, const float2* __restrict__ K) {
   constexpr int J = P::S - 1, R = P::R(J), RT = R/16, UNITS = P::N/(R*16);
   const half* Fr = F + P::Foff(J); const half* Fi = Fr + R*R;
   const float sc = rsqrtf((float)R);
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  float* sr = scr + warp*256;
+  TAcc* sr = scr + warp*256;
   const int rr = lane >> 1, cc0 = (lane & 1)*8;
   for (int u = warp; u < UNITS; u += W) {
     const int base = u*16*R;
@@ -134,7 +143,7 @@ __device__ __forceinline__ void right_stage(half* Xr, half* Xi, const half* F, f
     for (int kk = 0; kk < RT; kk++) { wmma::load_matrix_sync(ar[kk], Xr + base + kk*16, R); wmma::load_matrix_sync(ai[kk], Xi + base + kk*16, R); }
     #pragma unroll
     for (int i = 0; i < RT; i++) {
-      Acc cr, ci, t; wmma::fill_fragment(cr, 0.f); wmma::fill_fragment(ci, 0.f); wmma::fill_fragment(t, 0.f);
+      Acc<TAcc> cr, ci, t; wmma::fill_fragment(cr, 0.f); wmma::fill_fragment(ci, 0.f); wmma::fill_fragment(t, 0.f);
       #pragma unroll
       for (int kk = 0; kk < RT; kk++) {
         FB fr, fi; wmma::load_matrix_sync(fr, Fr + kk*16*R + i*16, R); wmma::load_matrix_sync(fi, Fi + kk*16*R + i*16, R);
@@ -163,12 +172,12 @@ __device__ __forceinline__ void right_stage(half* Xr, half* Xi, const half* F, f
   }
 }
 
-template<class P, int W, typename TIO>
+template<class P, int W, typename TIO, typename TAcc = float>
 __global__ void __launch_bounds__(W*32)
 fftconv(const TIO* __restrict__ u, const float2* __restrict__ Kf, const float2* __restrict__ tw, TIO* __restrict__ y, int B, int H) {
   constexpr int N = P::N, L = P::L;
   extern __shared__ __align__(128) unsigned char smem[];
-  half* Xr = (half*)smem; half* Xi = Xr + N; half* F = Xi + N; float* scr = (float*)(F + P::Fsize);
+  half* Xr = (half*)smem; half* Xi = Xr + N; half* F = Xi + N; TAcc* scr = (TAcc*)(F + P::Fsize);
   const int seq = blockIdx.x, h = seq / B, b = seq % B;       // batch fastest: Kf[h] stays hot in L2
   const TIO* up = u + ((size_t)b*H + h)*L; TIO* yp = y + ((size_t)b*H + h)*L;
   const float2* K = Kf + (size_t)h*N;
@@ -187,12 +196,12 @@ fftconv(const TIO* __restrict__ u, const float2* __restrict__ Kf, const float2* 
     st8h(Xr + idx, v); }
   for (int idx = L + tid*8; idx < N; idx += NT*8) *reinterpret_cast<uint4*>(Xr + idx) = make_uint4(0,0,0,0);
   __syncthreads();
-  left_stage<P,0,false,W,TIO>(Xr, Xi, F, scr, tw, K, yp); __syncthreads();
-  if constexpr (P::S == 3) { left_stage<P,1,false,W,TIO>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
-  right_stage<P,false,W>(Xr, Xi, F, scr, tw, K); __syncwarp();   // same warp owns the same strips: no block barrier
-  right_stage<P,true,W>(Xr, Xi, F, scr, tw, K); __syncthreads();
-  if constexpr (P::S == 3) { left_stage<P,1,true,W,TIO>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
-  left_stage<P,0,true,W,TIO>(Xr, Xi, F, scr, tw, K, yp);
+  left_stage<P,0,false,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp); __syncthreads();
+  if constexpr (P::S == 3) { left_stage<P,1,false,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
+  right_stage<P,false,W,TAcc>(Xr, Xi, F, scr, tw, K); __syncwarp();   // same warp owns the same strips: no block barrier
+  right_stage<P,true,W,TAcc>(Xr, Xi, F, scr, tw, K); __syncthreads();
+  if constexpr (P::S == 3) { left_stage<P,1,true,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp); __syncthreads(); }
+  left_stage<P,0,true,W,TIO,TAcc>(Xr, Xi, F, scr, tw, K, yp);
 }
 
 // ---- spectrum layout + cuFFT baseline ----
@@ -228,6 +237,7 @@ static double nrand() { return sqrt(-2*log(urand()))*cos(2*M_PI*urand()); }
 struct Bench {
   int L, N, H, B; size_t BH; int iters;
   std::vector<float> hu, hk, yref;
+  std::vector<Candidate> candidates;
   float *du, *dy, *dup, *dyp, *dyref; __nv_bfloat16 *dub, *dyb; float2 *dKh, *dtw; cufftComplex *dKc, *dU;
   cufftHandle pf, pi; cudaEvent_t e0, e1;
   template<class F> float timeit(F f) {
@@ -269,42 +279,99 @@ struct Bench {
     printf("RESULT,%d,cufft_pipeline_fp32,-,%.5f,%.3e\n", L, t_full, sqrt(rn/rd));
     printf("RESULT,%d,cufft_core_fp32,-,%.5f,%.3e\n", L, t_core, sqrt(rn/rd));
   }
-  template<class P, int W> void fused(const char* name) {
+  template<class P, int W, typename TAcc> void fused(const char* name) {
     if (P::L != L) { printf("bad plan\n"); exit(1); }
     float2* dKf; CK(cudaMalloc(&dKf, (size_t)H*N*8));
     permuteK<<<(unsigned)(((size_t)H*N+255)/256),256>>>(dKc, dKf, H, N, P::R(0), P::R(1), P::R(2));
-    constexpr int SM = P::template smem<W>();
-    CK(cudaFuncSetAttribute(fftconv<P,W,float>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
-    CK(cudaFuncSetAttribute(fftconv<P,W,__nv_bfloat16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
-    int occ = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fftconv<P,W,float>, W*32, SM));
-    auto f32 = [&]{ fftconv<P,W,float><<<(unsigned)BH, W*32, SM>>>(du, dKf, dtw, dy, B, H); };
-    auto b16 = [&]{ fftconv<P,W,__nv_bfloat16><<<(unsigned)BH, W*32, SM>>>(dub, dKf, dtw, dyb, B, H); };
+    constexpr int SM = P::template smem<W,TAcc>();
+    CK(cudaFuncSetAttribute(fftconv<P,W,float,TAcc>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+    CK(cudaFuncSetAttribute(fftconv<P,W,__nv_bfloat16,TAcc>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
+    int occ = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fftconv<P,W,float,TAcc>, W*32, SM));
+    auto f32 = [&]{ fftconv<P,W,float,TAcc><<<(unsigned)BH, W*32, SM>>>(du, dKf, dtw, dy, B, H); };
+    auto b16 = [&]{ fftconv<P,W,__nv_bfloat16,TAcc><<<(unsigned)BH, W*32, SM>>>(dub, dKf, dtw, dyb, B, H); };
     float t32 = timeit(f32), t16 = timeit(b16);
     f32(); CK(cudaDeviceSynchronize()); std::vector<float> y(BH*L); CK(cudaMemcpy(y.data(), dy, BH*L*4, cudaMemcpyDeviceToHost));
     std::vector<__nv_bfloat16> yb(BH*L); b16(); CK(cudaDeviceSynchronize()); CK(cudaMemcpy(yb.data(), dyb, BH*L*2, cudaMemcpyDeviceToHost));
     double n1 = 0, n2 = 0, d = 0;
     for (size_t i = 0; i < BH*L; i++) { double r = yref[i]; double a = y[i]-r, b = (double)__bfloat162float(yb[i])-r; n1 += a*a; n2 += b*b; d += r*r; }
-    printf("RESULT,%d,fused_fp32io,%s/w%d/occ%d/smem%d,%.5f,%.3e\n", L, name, W, occ, SM, t32, sqrt(n1/d));
-    printf("RESULT,%d,fused_bf16io,%s/w%d/occ%d/smem%d,%.5f,%.3e\n", L, name, W, occ, SM, t16, sqrt(n2/d));
+    char config[96]; snprintf(config, sizeof(config), "%s/w%d/occ%d/smem%d", name, W, occ, SM);
+    const char* m32 = sizeof(TAcc) == 4 ? "fused_fp32io" : "fused_fp16acc_fp32io";
+    const char* m16 = sizeof(TAcc) == 4 ? "fused_bf16io" : "fused_fp16acc_bf16io";
+    const double err32 = relative_l2(n1, d), err16 = relative_l2(n2, d);
+    candidates.push_back({m32, "fp32", config, t32, err32});
+    candidates.push_back({m16, "bf16", config, t16, err16});
+    printf("RESULT,%d,%s,%s,%.5f,%.3e\n", L, m32, config, t32, err32);
+    printf("RESULT,%d,%s,%s,%.5f,%.3e\n", L, m16, config, t16, err16);
     fflush(stdout); cudaFree(dKf);
   }
+  template<class P, int W> void variants(const char* name) { fused<P,W,float>(name); fused<P,W,half>(name); }
+  bool select(double max_error, const char* io) {
+    const Candidate* best = select_candidate(candidates, max_error, io);
+    if (!best) { printf("NO_MATCH,%d,%s,%.9e\n", L, io, max_error); return false; }
+    printf("SELECT,%d,%s,%s,%.5f,%.9e,%.9e,%s\n", L, best->method.c_str(), best->config.c_str(), best->ms, best->rel_err, max_error, best->io.c_str());
+    return true;
+  }
   ~Bench() { cufftDestroy(pf); cufftDestroy(pi); cudaFree(du); cudaFree(dy); cudaFree(dyref); cudaFree(dub); cudaFree(dyb);
-    cudaFree(dup); cudaFree(dyp); cudaFree(dU); cudaFree(dKc); cudaFree(dKh); cudaFree(dtw); }
+    cudaFree(dup); cudaFree(dyp); cudaFree(dU); cudaFree(dKc); cudaFree(dKh); cudaFree(dtw); cudaEventDestroy(e0); cudaEventDestroy(e1); }
 };
 
+static void usage() {
+  printf("Usage: sffft [B H [L]] [--max-error REL_L2] [--io fp32|bf16|any] [--seed N]\n"
+         "L: 0 (all) or a power of two from 128 to 8192. Defaults: B=8 H=768, io=fp32.\n"
+         "--max-error selects the fastest passing fused plan on these calibration inputs.\n"
+         "Error is measured against cuFFT fp32; no match exits 2. Invalid arguments exit 1.\n");
+}
+
 int main(int argc, char** argv) {
+  int B = 8, H = 768, only = 0, positional = 0, failed = 0;
+  double max_error = -1; const char* io = "fp32";
+  for (int i = 1; i < argc; i++) {
+    const char* arg = argv[i]; char* end = nullptr; errno = 0;
+    if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) { usage(); return 0; }
+    if (!strcmp(arg, "--max-error")) {
+      if (++i == argc) { usage(); return 1; }
+      max_error = strtod(argv[i], &end);
+      if (errno || end == argv[i] || *end || !std::isfinite(max_error) || max_error <= 0) {
+        fprintf(stderr, "--max-error must be positive and finite\n"); return 1;
+      }
+    } else if (!strcmp(arg, "--io")) {
+      if (++i == argc) { usage(); return 1; }
+      io = argv[i];
+      if (strcmp(io, "fp32") && strcmp(io, "bf16") && strcmp(io, "any")) {
+        fprintf(stderr, "--io must be fp32, bf16, or any\n"); return 1;
+      }
+    } else if (!strcmp(arg, "--seed")) {
+      if (++i == argc) { usage(); return 1; }
+      rng = strtoull(argv[i], &end, 10);
+      if (errno || end == argv[i] || *end || argv[i][0] == '-' || !rng) {
+        fprintf(stderr, "--seed must be a nonzero unsigned integer\n"); return 1;
+      }
+    } else {
+      long value = strtol(arg, &end, 10);
+      if (errno || end == arg || *end || value < 0 || value > INT_MAX || positional == 3) {
+        fprintf(stderr, "Invalid argument: %s\n", arg); usage(); return 1;
+      }
+      if (positional == 0) B = (int)value;
+      else if (positional == 1) H = (int)value;
+      else only = (int)value;
+      positional++;
+    }
+  }
+  if (B < 1 || H < 1 || (long long)B*H > INT_MAX || (only && (only < 128 || only > 8192 || (only & (only-1))))) {
+    fprintf(stderr, "B and H must be positive with B*H <= INT_MAX; L must be 0 or 128,256,512,1024,2048,4096,8192\n"); return 1;
+  }
   cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, 0));
-  int B = argc > 1 ? atoi(argv[1]) : 8, H = argc > 2 ? atoi(argv[2]) : 768;
   printf("# %s sm_%d%d %d SMs, smem/block %zu, L2 %d MB, B=%d H=%d\n", p.name, p.major, p.minor, p.multiProcessorCount, p.sharedMemPerBlockOptin, p.l2CacheSize>>20, B, H);
+  printf("# calibration seed=%llu, max_error=%.9e, io=%s\n", rng, max_error, io);
   printf("# RESULT,L,method,config,ms,rel_err\n");
-  int only = argc > 3 ? atoi(argv[3]) : 0;
-#define RUN(LL, ...) if (!only || only == LL) { Bench b(LL, B, H); b.baseline(); __VA_ARGS__ }
-  RUN(128,  b.fused<Plan<16,16>,4>("16x16"); b.fused<Plan<16,16>,8>("16x16"); )
-  RUN(256,  b.fused<Plan<32,16>,4>("32x16"); b.fused<Plan<16,32>,4>("16x32"); b.fused<Plan<32,16>,8>("32x16"); )
-  RUN(512,  b.fused<Plan<32,32>,4>("32x32"); b.fused<Plan<32,32>,8>("32x32"); b.fused<Plan<64,16>,4>("64x16"); b.fused<Plan<16,64>,4>("16x64"); )
-  RUN(1024, b.fused<Plan<64,32>,4>("64x32"); b.fused<Plan<32,64>,4>("32x64"); b.fused<Plan<64,32>,8>("64x32"); b.fused<Plan<32,64>,8>("32x64"); )
-  RUN(2048, b.fused<Plan<16,16,16>,4>("16x16x16"); b.fused<Plan<16,16,16>,8>("16x16x16"); b.fused<Plan<64,64>,8>("64x64"); b.fused<Plan<64,64>,4>("64x64"); )
-  RUN(4096, b.fused<Plan<32,16,16>,4>("32x16x16"); b.fused<Plan<16,32,16>,4>("16x32x16"); b.fused<Plan<16,16,32>,4>("16x16x32"); b.fused<Plan<32,16,16>,8>("32x16x16"); b.fused<Plan<16,16,32>,8>("16x16x32"); )
-  RUN(8192, b.fused<Plan<32,32,16>,4>("32x32x16"); b.fused<Plan<16,32,32>,4>("16x32x32"); b.fused<Plan<64,16,16>,4>("64x16x16"); b.fused<Plan<32,32,16>,8>("32x32x16"); b.fused<Plan<16,32,32>,8>("16x32x32"); b.fused<Plan<16,16,64>,8>("16x16x64"); )
-  return 0;
+  if (max_error > 0) printf("# SELECT,L,method,config,ms,rel_err,max_error,io\n");
+#define RUN(LL, ...) if (!only || only == LL) { Bench b(LL, B, H); b.baseline(); __VA_ARGS__ if (max_error > 0 && !b.select(max_error, io)) failed++; }
+  RUN(128,  b.variants<Plan<16,16>,4>("16x16"); b.variants<Plan<16,16>,8>("16x16"); )
+  RUN(256,  b.variants<Plan<32,16>,4>("32x16"); b.variants<Plan<16,32>,4>("16x32"); b.variants<Plan<32,16>,8>("32x16"); )
+  RUN(512,  b.variants<Plan<32,32>,4>("32x32"); b.variants<Plan<32,32>,8>("32x32"); b.variants<Plan<64,16>,4>("64x16"); b.variants<Plan<16,64>,4>("16x64"); )
+  RUN(1024, b.variants<Plan<64,32>,4>("64x32"); b.variants<Plan<32,64>,4>("32x64"); b.variants<Plan<64,32>,8>("64x32"); b.variants<Plan<32,64>,8>("32x64"); )
+  RUN(2048, b.variants<Plan<16,16,16>,4>("16x16x16"); b.variants<Plan<16,16,16>,8>("16x16x16"); b.variants<Plan<64,64>,8>("64x64"); b.variants<Plan<64,64>,4>("64x64"); )
+  RUN(4096, b.variants<Plan<32,16,16>,4>("32x16x16"); b.variants<Plan<16,32,16>,4>("16x32x16"); b.variants<Plan<16,16,32>,4>("16x16x32"); b.variants<Plan<32,16,16>,8>("32x16x16"); b.variants<Plan<16,16,32>,8>("16x16x32"); )
+  RUN(8192, b.variants<Plan<32,32,16>,4>("32x32x16"); b.variants<Plan<16,32,32>,4>("16x32x32"); b.variants<Plan<64,16,16>,4>("64x16x16"); b.variants<Plan<32,32,16>,8>("32x32x16"); b.variants<Plan<16,32,32>,8>("16x32x32"); b.variants<Plan<16,16,64>,8>("16x16x64"); )
+  return failed ? 2 : 0;
 }
