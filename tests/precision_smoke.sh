@@ -25,6 +25,8 @@ check_exit 1 --seed 0
 check_exit 1 --seed -1
 check_exit 1 --input-scale inf
 check_exit 1 --input-scale 0
+check_exit 1 --allocator unknown
+check_exit 1 --allocator
 check_exit 1 0 1 128
 check_exit 1 1 0 128
 check_exit 1 1 1 129
@@ -51,3 +53,13 @@ awk -F, '
 check_exit 2 1 1 128 --max-error 1e-3 --io fp32 --input-scale 25000
 grep -q '^NO_MATCH,128,fp32,' "$work/check.csv"
 printf 'PASS: CLI validation, unattainable targets, I/O constraints, two seeds, and FP16 overflow rejection\n'
+
+for allocator in device managed mapped; do
+  ./sffft 1 1 --max-error 1e-3 --io fp32 --allocator "$allocator" > "$work/allocator.csv"
+  awk -F, -v allocator="$allocator" '
+    $1=="SELECT" { n++; if ($6+0 > $7+0 || $8!="fp32") bad++ }
+    $1=="MEMORY" { m++; if ($3!=allocator || (allocator!="device" && ($7+0!=0 || $8+0!=0 || $5+0!=0))) bad++ }
+    END { if(n!=7 || m!=7 || bad) exit 1 }
+  ' "$work/allocator.csv"
+done
+printf 'PASS: device, managed, and mapped allocations preserve error budgets and shared CPU views avoid explicit copies\n'

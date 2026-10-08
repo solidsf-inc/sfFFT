@@ -121,6 +121,23 @@ At the original batch size of 8 x 768 channels, three sequential sweeps with CUD
 
 Raw candidate timings and selections are in [`results/gb10_precision_sweep.csv`](results/gb10_precision_sweep.csv). FP16 accumulation was 1.11x–1.32x faster in this experiment, with about 0.24% relative L2 error. This is a measured improvement for the supplied workload, and does not establish a worst-case error bound. FP32 I/O candidates with FP16 accumulation measured approximately 0.05%–0.07% error, allowing a 0.1% target on these inputs.
 
+## GB10 allocation modes
+
+sfFFT can allocate its owned buffers using device memory, managed memory, or mapped CPU memory:
+
+```bash
+./sffft --memory-info
+./sffft 8 768 2048 --max-error 1e-2 --io bf16 --allocator device
+./sffft 8 768 2048 --max-error 1e-2 --io bf16 --allocator managed
+./sffft 8 768 2048 --max-error 1e-2 --io bf16 --allocator mapped
+```
+
+`device` remains the default. `mapped` uses `cudaHostAllocMapped` and the CUDA device alias, providing a CPU allocation that the GPU can access directly. `managed` uses `cudaMallocManaged`, with prefetching when concurrent managed access is supported. Both host-visible modes generate the input and filter directly in shared CPU/GPU allocations, and validate outputs through synchronized CPU views. The filter-spectrum workspace is allocated once per length and reused across all plans.
+
+The implementation uses public CUDA APIs. GB10 has a shared physical memory architecture; this mode does not create a separate Grace/HBM memory tier. [NVIDIA's Spark porting guide](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html) explains that `cudaMalloc` allocations on Spark cannot be coherently accessed by the CPU, while [CUDA's memory guide](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/understanding-memory.html) describes managed and mapped allocations. Allocator support is checked at runtime, and unsupported requests fail explicitly.
+
+`RESULT` and `SELECT` continue to measure warmed GPU execution. Additional `MEMORY` rows report owned allocation bytes, persistent host shadow bytes, allocation time, explicit upload/download bytes, explicit copy time, and constructor setup time. Setup includes the benchmark's generated inputs and cuFFT plan/spectrum preparation. These fields separate allocator/setup effects from kernel speed; cuFFT's internal workspaces and temporary validation vectors are outside the owned-buffer byte count. Host-visible modes avoid explicit host/device copies but still access physical memory and may incur coherence or page-management costs.
+
 ## Status and limitations
 
 This is an early release. Please read these before you depend on it.

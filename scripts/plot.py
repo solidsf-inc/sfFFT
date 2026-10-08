@@ -17,7 +17,7 @@ H = int(sys.argv[4]) if len(sys.argv) > 4 else 768
 best = collections.defaultdict(dict)   # method -> L -> best ms over plans
 gpu = ""
 for r in csv.reader(open(src)):
-    if r and r[0].startswith("# ") and not gpu and "RESULT" not in r[0]:
+    if r and r[0].startswith("# ") and not gpu and " sm_" in r[0]:
         gpu = r[0][2:].split(" sm_")[0]
     if not r or r[0] != "RESULT":
         continue

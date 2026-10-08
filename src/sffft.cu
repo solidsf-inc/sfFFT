@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstring>
+#include <chrono>
 #include "selection.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -20,6 +21,68 @@ using namespace nvcuda;
 
 #define CK(x) do{cudaError_t e_=(x); if(e_!=cudaSuccess){printf("CUDA %s @%d: %s\n",#x,__LINE__,cudaGetErrorString(e_));exit(1);}}while(0)
 #define CF(x) do{cufftResult r_=(x); if(r_!=CUFFT_SUCCESS){printf("cuFFT %s @%d: %d\n",#x,__LINE__,(int)r_);exit(1);}}while(0)
+
+enum class Allocation { Device, Managed, Mapped };
+static const char* allocation_name(Allocation mode) {
+  return mode == Allocation::Device ? "device" : mode == Allocation::Managed ? "managed" : "mapped";
+}
+using Clock = std::chrono::steady_clock;
+static double elapsed_ms(Clock::time_point start) { return std::chrono::duration<double,std::milli>(Clock::now()-start).count(); }
+
+struct Memory {
+  struct Block { void* device; void* host; size_t bytes; };
+  Allocation mode; bool can_prefetch;
+  std::vector<Block> blocks;
+  size_t owned_bytes = 0, upload_bytes = 0, download_bytes = 0;
+  double allocation_ms = 0, copy_ms = 0;
+  Memory(Allocation mode_, bool can_prefetch_) : mode(mode_), can_prefetch(can_prefetch_) {}
+  Memory(const Memory&) = delete;
+  Memory& operator=(const Memory&) = delete;
+  template<typename T> void allocate(T** pointer, size_t bytes) {
+    auto start = Clock::now(); void* device = nullptr; void* host = nullptr;
+    if (mode == Allocation::Mapped) {
+      CK(cudaHostAlloc(&host, bytes, cudaHostAllocMapped)); CK(cudaHostGetDevicePointer(&device, host, 0));
+    } else if (mode == Allocation::Managed) {
+      CK(cudaMallocManaged(&device, bytes)); host = device;
+    } else { CK(cudaMalloc(&device, bytes)); }
+    *pointer = static_cast<T*>(device); blocks.push_back({device, host, bytes}); owned_bytes += bytes;
+    allocation_ms += elapsed_ms(start);
+  }
+  template<typename T> T* host_pointer(const T* device) {
+    for (const auto& block : blocks) if (block.device == device) return static_cast<T*>(block.host);
+    return nullptr;
+  }
+  void prefetch(const void* pointer, size_t bytes, bool to_gpu) {
+    if (mode != Allocation::Managed || !can_prefetch) return;
+#if CUDART_VERSION >= 13000
+    cudaMemLocation location{}; location.type = to_gpu ? cudaMemLocationTypeDevice : cudaMemLocationTypeHost; location.id = 0;
+    CK(cudaMemPrefetchAsync(pointer, bytes, location, 0));
+#else
+    CK(cudaMemPrefetchAsync(pointer, bytes, to_gpu ? 0 : cudaCpuDeviceId));
+#endif
+  }
+  void prepare_gpu() { for (const auto& block : blocks) prefetch(block.device, block.bytes, true); }
+  template<typename T> void upload(T* device, const T* source, size_t count) {
+    T* host = host_pointer(device); if (host == source) return;
+    auto start = Clock::now();
+    if (host) std::memcpy(host, source, count*sizeof(T));
+    else { CK(cudaMemcpy(device, source, count*sizeof(T), cudaMemcpyHostToDevice)); upload_bytes += count*sizeof(T); }
+    copy_ms += elapsed_ms(start);
+  }
+  template<typename T> const T* read(const T* device, size_t count, std::vector<T>& shadow) {
+    if (T* host = host_pointer(device)) {
+      prefetch(device, count*sizeof(T), false); CK(cudaDeviceSynchronize()); return host;
+    }
+    shadow.resize(count); auto start = Clock::now();
+    CK(cudaMemcpy(shadow.data(), device, count*sizeof(T), cudaMemcpyDeviceToHost));
+    download_bytes += count*sizeof(T); copy_ms += elapsed_ms(start); return shadow.data();
+  }
+  ~Memory() {
+    for (const auto& block : blocks) {
+      if (mode == Allocation::Mapped) CK(cudaFreeHost(block.host)); else CK(cudaFree(block.device));
+    }
+  }
+};
 
 template<typename TAcc> using Acc = wmma::fragment<wmma::accumulator,16,16,16,TAcc>;
 typedef wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> FA;
@@ -236,42 +299,50 @@ static double nrand() { return sqrt(-2*log(urand()))*cos(2*M_PI*urand()); }
 
 struct Bench {
   int L, N, H, B; size_t BH; int iters;
-  std::vector<float> hu, hk, yref;
+  Memory memory;
+  std::vector<float> hu_shadow, hk, yref_shadow;
+  float* hu; const float* yref = nullptr; double setup_ms = 0;
   std::vector<Candidate> candidates;
-  float *du, *dy, *dup, *dyp, *dyref; __nv_bfloat16 *dub, *dyb; float2 *dKh, *dtw; cufftComplex *dKc, *dU;
+  float *du, *dy, *dup, *dyp, *dyref; __nv_bfloat16 *dub, *dyb; float2 *dKh, *dtw, *dKf; cufftComplex *dKc, *dU;
   cufftHandle pf, pi; cudaEvent_t e0, e1;
   template<class F> float timeit(F f) {
     for (int i = 0; i < 3; i++) f(); CK(cudaDeviceSynchronize());
     CK(cudaEventRecord(e0)); for (int i = 0; i < iters; i++) f(); CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
     float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); CK(cudaGetLastError()); return ms/iters; }
-  Bench(int L_, int B_, int H_, double input_scale = 1) : L(L_), N(2*L_), H(H_), B(B_), BH((size_t)B_*H_) {
+  Bench(int L_, int B_, int H_, double input_scale, Allocation mode, bool can_prefetch) : L(L_), N(2*L_), H(H_), B(B_), BH((size_t)B_*H_), memory(mode, can_prefetch) {
+    auto start = Clock::now();
     iters = std::max(10, (int)(20000/L)); if (iters > 200) iters = 200;
-    hu.resize(BH*L); hk.resize((size_t)H*L);
-    for (auto& v : hu) v = (float)(nrand()*input_scale);
+    int M = N/2+1;
+    memory.allocate(&du, BH*L*4); memory.allocate(&dy, BH*L*4); memory.allocate(&dyref, BH*L*4);
+    memory.allocate(&dub, BH*L*2); memory.allocate(&dyb, BH*L*2);
+    memory.allocate(&dup, BH*N*4); memory.allocate(&dyp, BH*N*4); memory.allocate(&dU, BH*M*8);
+    memory.allocate(&dKc, (size_t)H*N*8); memory.allocate(&dKh, (size_t)H*M*8); memory.allocate(&dtw, N*8);
+    memory.allocate(&dKf, (size_t)H*N*8);
+    hu = memory.host_pointer(du);
+    if (!hu) { hu_shadow.resize(BH*L); hu = hu_shadow.data(); }
+    hk.resize((size_t)H*L);
+    for (size_t i = 0; i < BH*L; i++) hu[i] = (float)(nrand()*input_scale);
     for (int h = 0; h < H; h++) { double a = 1.0/(4.0 + (double)L*h/H);
       for (int n = 0; n < L; n++) hk[(size_t)h*L+n] = (float)(nrand()*exp(-a*n)*sqrt(2*a)); }
-    std::vector<cufftComplex> hkc((size_t)H*N);
+    std::vector<cufftComplex> hkc_shadow; cufftComplex* hkc = memory.host_pointer(dKc);
+    if (!hkc) { hkc_shadow.resize((size_t)H*N); hkc = hkc_shadow.data(); }
     for (int h = 0; h < H; h++) for (int n = 0; n < N; n++) hkc[(size_t)h*N+n] = make_cuComplex(n < L ? hk[(size_t)h*L+n] : 0.f, 0.f);
-    std::vector<float2> htw(N); for (int j = 0; j < N; j++) { double t = 2*M_PI*j/N; htw[j] = make_float2((float)cos(t), (float)-sin(t)); }
-    int M = N/2+1;
-    CK(cudaMalloc(&du, BH*L*4)); CK(cudaMalloc(&dy, BH*L*4)); CK(cudaMalloc(&dyref, BH*L*4));
-    CK(cudaMalloc(&dub, BH*L*2)); CK(cudaMalloc(&dyb, BH*L*2));
-    CK(cudaMalloc(&dup, BH*N*4)); CK(cudaMalloc(&dyp, BH*N*4)); CK(cudaMalloc(&dU, BH*M*8));
-    CK(cudaMalloc(&dKc, (size_t)H*N*8)); CK(cudaMalloc(&dKh, (size_t)H*M*8)); CK(cudaMalloc(&dtw, N*8));
-    CK(cudaMemcpy(du, hu.data(), BH*L*4, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dKc, hkc.data(), (size_t)H*N*8, cudaMemcpyHostToDevice));
-    CK(cudaMemcpy(dtw, htw.data(), N*8, cudaMemcpyHostToDevice));
+    std::vector<float2> htw_shadow; float2* htw = memory.host_pointer(dtw);
+    if (!htw) { htw_shadow.resize(N); htw = htw_shadow.data(); }
+    for (int j = 0; j < N; j++) { double t = 2*M_PI*j/N; htw[j] = make_float2((float)cos(t), (float)-sin(t)); }
+    memory.upload(du, hu, BH*L); memory.upload(dKc, hkc, (size_t)H*N); memory.upload(dtw, htw, N);
+    memory.prepare_gpu();
     tobf16<<<(unsigned)((BH*L+255)/256),256>>>(du, dub, BH*L);
     cufftHandle pk; CF(cufftPlan1d(&pk, N, CUFFT_C2C, H)); CF(cufftExecC2C(pk, dKc, dKc, CUFFT_FORWARD)); cufftDestroy(pk);
     halfK<<<(unsigned)(((size_t)H*M+255)/256),256>>>(dKc, dKh, H, N);
     CF(cufftPlan1d(&pf, N, CUFFT_R2C, (int)BH)); CF(cufftPlan1d(&pi, N, CUFFT_C2R, (int)BH));
-    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaDeviceSynchronize());
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1)); CK(cudaDeviceSynchronize()); setup_ms = elapsed_ms(start);
   }
   void core() { int M = N/2+1; CF(cufftExecR2C(pf, dup, dU)); mulK<<<(unsigned)((BH*M+255)/256),256>>>(dU, dKh, BH, H, M); CF(cufftExecC2R(pi, dU, dyp)); }
   void full() { padK<<<(unsigned)((BH*N+255)/256),256>>>(du, dup, BH, L); core(); sliceK<<<(unsigned)((BH*L+255)/256),256>>>(dyp, dyref, BH, L); }
   void baseline() {
     float t_full = timeit([&]{ full(); }), t_core = timeit([&]{ core(); });
-    full(); CK(cudaDeviceSynchronize()); yref.resize(BH*L); CK(cudaMemcpy(yref.data(), dyref, BH*L*4, cudaMemcpyDeviceToHost));
+    full(); CK(cudaDeviceSynchronize()); yref = memory.read(dyref, BH*L, yref_shadow);
     double rn = 0, rd = 0;
     for (size_t s : {(size_t)0, BH/2, BH-1}) { int h = s % H;
       for (int n = 0; n < L; n++) { double acc = 0; for (int m = 0; m <= n; m++) acc += (double)hu[s*L+m]*hk[(size_t)h*L+n-m];
@@ -281,7 +352,6 @@ struct Bench {
   }
   template<class P, int W, typename TAcc> void fused(const char* name) {
     if (P::L != L) { printf("bad plan\n"); exit(1); }
-    float2* dKf; CK(cudaMalloc(&dKf, (size_t)H*N*8));
     permuteK<<<(unsigned)(((size_t)H*N+255)/256),256>>>(dKc, dKf, H, N, P::R(0), P::R(1), P::R(2));
     constexpr int SM = P::template smem<W,TAcc>();
     CK(cudaFuncSetAttribute(fftconv<P,W,float,TAcc>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
@@ -290,8 +360,8 @@ struct Bench {
     auto f32 = [&]{ fftconv<P,W,float,TAcc><<<(unsigned)BH, W*32, SM>>>(du, dKf, dtw, dy, B, H); };
     auto b16 = [&]{ fftconv<P,W,__nv_bfloat16,TAcc><<<(unsigned)BH, W*32, SM>>>(dub, dKf, dtw, dyb, B, H); };
     float t32 = timeit(f32), t16 = timeit(b16);
-    f32(); CK(cudaDeviceSynchronize()); std::vector<float> y(BH*L); CK(cudaMemcpy(y.data(), dy, BH*L*4, cudaMemcpyDeviceToHost));
-    std::vector<__nv_bfloat16> yb(BH*L); b16(); CK(cudaDeviceSynchronize()); CK(cudaMemcpy(yb.data(), dyb, BH*L*2, cudaMemcpyDeviceToHost));
+    f32(); CK(cudaDeviceSynchronize()); std::vector<float> y_shadow; const float* y = memory.read(dy, BH*L, y_shadow);
+    std::vector<__nv_bfloat16> yb_shadow; b16(); CK(cudaDeviceSynchronize()); const __nv_bfloat16* yb = memory.read(dyb, BH*L, yb_shadow);
     double n1 = 0, n2 = 0, d = 0;
     for (size_t i = 0; i < BH*L; i++) { double r = yref[i]; double a = y[i]-r, b = (double)__bfloat162float(yb[i])-r; n1 += a*a; n2 += b*b; d += r*r; }
     char config[96]; snprintf(config, sizeof(config), "%s/w%d/occ%d/smem%d", name, W, occ, SM);
@@ -302,7 +372,7 @@ struct Bench {
     candidates.push_back({m16, "bf16", config, t16, err16});
     printf("RESULT,%d,%s,%s,%.5f,%.3e\n", L, m32, config, t32, err32);
     printf("RESULT,%d,%s,%s,%.5f,%.3e\n", L, m16, config, t16, err16);
-    fflush(stdout); cudaFree(dKf);
+    fflush(stdout);
   }
   template<class P, int W> void variants(const char* name) { fused<P,W,float>(name); fused<P,W,half>(name); }
   bool select(double max_error, const char* io) {
@@ -311,12 +381,15 @@ struct Bench {
     printf("SELECT,%d,%s,%s,%.5f,%.9e,%.9e,%s\n", L, best->method.c_str(), best->config.c_str(), best->ms, best->rel_err, max_error, best->io.c_str());
     return true;
   }
-  ~Bench() { cufftDestroy(pf); cufftDestroy(pi); cudaFree(du); cudaFree(dy); cudaFree(dyref); cudaFree(dub); cudaFree(dyb);
-    cudaFree(dup); cudaFree(dyp); cudaFree(dU); cudaFree(dKc); cudaFree(dKh); cudaFree(dtw); cudaEventDestroy(e0); cudaEventDestroy(e1); }
+  void report_memory() {
+    printf("MEMORY,%d,%s,%zu,%zu,%.3f,%zu,%zu,%.3f,%.3f\n", L, allocation_name(memory.mode), memory.owned_bytes,
+           (hu_shadow.size()+yref_shadow.size())*sizeof(float), memory.allocation_ms, memory.upload_bytes, memory.download_bytes, memory.copy_ms, setup_ms);
+  }
+  ~Bench() { cufftDestroy(pf); cufftDestroy(pi); cudaEventDestroy(e0); cudaEventDestroy(e1); }
 };
 
 static void usage() {
-  printf("Usage: sffft [B H [L]] [--max-error REL_L2] [--io fp32|bf16|any] [--seed N] [--input-scale SCALE]\n"
+  printf("Usage: sffft [B H [L]] [--max-error REL_L2] [--io fp32|bf16|any] [--seed N] [--input-scale SCALE] [--allocator device|managed|mapped] [--memory-info]\n"
          "L: 0 (all) or a power of two from 128 to 8192. Defaults: B=8 H=768, io=fp32.\n"
          "--max-error selects the fastest passing fused plan on these calibration inputs.\n"
          "Error is measured against cuFFT fp32; no match exits 2. Invalid arguments exit 1.\n");
@@ -325,10 +398,18 @@ static void usage() {
 int main(int argc, char** argv) {
   int B = 8, H = 768, only = 0, positional = 0, failed = 0;
   double max_error = -1, input_scale = 1; const char* io = "fp32";
+  Allocation allocation = Allocation::Device; bool memory_info = false;
   for (int i = 1; i < argc; i++) {
     const char* arg = argv[i]; char* end = nullptr; errno = 0;
     if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) { usage(); return 0; }
-    if (!strcmp(arg, "--max-error")) {
+    if (!strcmp(arg, "--memory-info")) { memory_info = true; continue; }
+    if (!strcmp(arg, "--allocator")) {
+      if (++i == argc) { usage(); return 1; }
+      if (!strcmp(argv[i], "device")) allocation = Allocation::Device;
+      else if (!strcmp(argv[i], "managed")) allocation = Allocation::Managed;
+      else if (!strcmp(argv[i], "mapped")) allocation = Allocation::Mapped;
+      else { fprintf(stderr, "--allocator must be device, managed, or mapped\n"); return 1; }
+    } else if (!strcmp(arg, "--max-error")) {
       if (++i == argc) { usage(); return 1; }
       max_error = strtod(argv[i], &end);
       if (errno || end == argv[i] || *end || !std::isfinite(max_error) || max_error <= 0) {
@@ -366,12 +447,24 @@ int main(int argc, char** argv) {
   if (B < 1 || H < 1 || (long long)B*H > INT_MAX || (only && (only < 128 || only > 8192 || (only & (only-1))))) {
     fprintf(stderr, "B and H must be positive with B*H <= INT_MAX; L must be 0 or 128,256,512,1024,2048,4096,8192\n"); return 1;
   }
+  if (allocation == Allocation::Mapped) CK(cudaSetDeviceFlags(cudaDeviceMapHost));
   cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, 0));
+  int managed = 0, concurrent = 0, pageable = 0, host_tables = 0;
+  CK(cudaDeviceGetAttribute(&managed, cudaDevAttrManagedMemory, 0));
+  CK(cudaDeviceGetAttribute(&concurrent, cudaDevAttrConcurrentManagedAccess, 0));
+  CK(cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, 0));
+  CK(cudaDeviceGetAttribute(&host_tables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, 0));
+  printf("# MEMORY_CAPS,mapped=%d,managed=%d,concurrent_managed=%d,pageable=%d,host_page_tables=%d,integrated=%d\n", p.canMapHostMemory, managed, concurrent, pageable, host_tables, p.integrated);
+  if (memory_info) return 0;
+  if ((allocation == Allocation::Mapped && !p.canMapHostMemory) || (allocation == Allocation::Managed && !managed)) {
+    fprintf(stderr, "Requested allocator is unsupported on this device\n"); return 1;
+  }
   printf("# %s sm_%d%d %d SMs, smem/block %zu, L2 %d MB, B=%d H=%d\n", p.name, p.major, p.minor, p.multiProcessorCount, p.sharedMemPerBlockOptin, p.l2CacheSize>>20, B, H);
-  printf("# calibration seed=%llu, input_scale=%.9e, max_error=%.9e, io=%s\n", rng, input_scale, max_error, io);
+  printf("# calibration seed=%llu, input_scale=%.9e, max_error=%.9e, io=%s,allocator=%s\n", rng, input_scale, max_error, io, allocation_name(allocation));
   printf("# RESULT,L,method,config,ms,rel_err\n");
+  printf("# MEMORY,L,allocator,owned_bytes,persistent_host_shadow_bytes,allocation_ms,upload_bytes,download_bytes,copy_ms,setup_ms\n");
   if (max_error > 0) printf("# SELECT,L,method,config,ms,rel_err,max_error,io\n");
-#define RUN(LL, ...) if (!only || only == LL) { Bench b(LL, B, H, input_scale); b.baseline(); __VA_ARGS__ if (max_error > 0 && !b.select(max_error, io)) failed++; }
+#define RUN(LL, ...) if (!only || only == LL) { Bench b(LL, B, H, input_scale, allocation, concurrent); b.baseline(); __VA_ARGS__ if (max_error > 0 && !b.select(max_error, io)) failed++; b.report_memory(); }
   RUN(128,  b.variants<Plan<16,16>,4>("16x16"); b.variants<Plan<16,16>,8>("16x16"); )
   RUN(256,  b.variants<Plan<32,16>,4>("32x16"); b.variants<Plan<16,32>,4>("16x32"); b.variants<Plan<32,16>,8>("32x16"); )
   RUN(512,  b.variants<Plan<32,32>,4>("32x32"); b.variants<Plan<32,32>,8>("32x32"); b.variants<Plan<64,16>,4>("64x16"); b.variants<Plan<16,64>,4>("16x64"); )
